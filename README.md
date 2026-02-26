@@ -1,6 +1,6 @@
 # claude-config-broker
 
-A PowerShell daemon that prevents `.claude.json` corruption caused by concurrent Claude Code sessions.
+A two-layer defense system that prevents `.claude.json` corruption caused by concurrent Claude Code sessions.
 
 ## The Problem
 
@@ -17,21 +17,36 @@ With just 2 parallel sessions, users report **hundreds of corrupted backup files
 
 ## How It Works
 
-The Config Broker Daemon acts as a post-write serializer that sits between Claude Code's writes and the filesystem:
+The Config Broker uses a two-layer architecture:
+
+### Layer 1: Bun Preload (Preventive)
+
+A JavaScript module (`claude-atomic-writes.js`) that patches file write functions (`fs.writeFileSync`, `fs.writeFile`, `fs.promises.writeFile`, `Bun.write`) at the Bun runtime level. When Claude Code writes to `.claude.json`, the write is transparently redirected through a temp-file + rename pattern, eliminating the truncation window entirely.
+
+> **Note**: Claude Code v2.1.59 is compiled with `--no-compile-autoload-bunfig`, which means the Bun preload is currently not loaded. If Anthropic re-enables `bunfig.toml` autoloading in a future version, Layer 1 will activate automatically. Until then, Layer 2 is the active defense.
+
+### Layer 2: Broker Daemon (Reactive Safety Net)
+
+A PowerShell daemon that monitors `.claude.json` via FileSystemWatcher and repairs corruption within ~100-200ms:
 
 ```
+~/bunfig.toml → preload = ["~/.claude/claude-atomic-writes.js"]
+        |
+        v
 +----------------+     +----------------+
 | Claude CLI 1   |     | Claude CLI 2   |    ... N instances
+| (Bun preload)  |     | (Bun preload)  |
 +-------+--------+     +-------+--------+
-        |  write               |  write
+        |  atomic write        |  atomic write
+        |  (temp+rename)       |  (temp+rename)
         v                      v
 +--------------------------------------+
-|        .claude.json (NTFS)           |  <-- Race condition zone
+|        .claude.json (NTFS)           |  ← always valid on disk
 +------------------+-------------------+
-                   |  FileSystemWatcher (event-based)
+                   |  FileSystemWatcher
                    v
 +--------------------------------------+
-|       Config Broker Daemon           |
+|    Config Broker Daemon (Layer 2)    |
 |  +--------------------------------+  |
 |  |  Named Mutex Lock              |  |
 |  |  JSON Validate + Deep Merge    |  |
@@ -46,19 +61,21 @@ On every detected file change:
 1. **Validate** -- Parse the JSON. If valid, proceed. If corrupt, restore immediately.
 2. **Lock** -- Acquire a system-wide Named Mutex (`Global\ClaudeConfigBrokerMutex`) to serialize all operations.
 3. **Merge** -- Deep-merge the incoming write with the shadow state (kept in RAM) to preserve changes from all sessions.
-4. **Write** -- Write the merged result back using atomic temp-file + rename.
+4. **Write** -- Write the merged result back using atomic temp-file + rename (`File.Replace` / Win32 `ReplaceFile`).
 
-Corruption is typically repaired within ~300-400ms, before the next Claude session reads the file.
+Corruption is typically repaired within ~100-200ms, before the next Claude session reads the file.
 
 ## Features
 
+- **Two-layer defense** -- preventive (Bun preload) + reactive (broker daemon)
 - **Event-based FileSystemWatcher** with debounce -- no polling, low CPU usage
 - **Gap detection fallback** -- catches the rare missed FSW event via `LastWriteTimeUtc` comparison
 - **Named Mutex** -- system-wide cross-process locking (no admin required)
 - **JSON deep-merge** -- concurrent changes from different sessions are preserved, not overwritten
-- **Atomic writes** -- temp-file + rename pattern prevents further corruption
+- **Atomic writes** -- `File.Replace` (Win32 `ReplaceFile`) for the broker; temp + rename for the preload
 - **Shadow state** -- persisted to RAM and disk for crash recovery
 - **Cross-runtime** -- works on PowerShell 5.1 (.NET Framework) and PowerShell 7+ (.NET 6/8/9)
+- **BOM-free UTF-8** -- all writes use `UTF8Encoding(false)` to avoid breaking `JSON.parse()`
 - **Single-instance guard** -- only one broker runs per machine, safe to call from multiple terminals
 - **Log rotation** -- automatic rotation at configurable size
 - **Stale backup cleanup** -- removes accumulated `.corrupted.*` files older than N days
@@ -69,7 +86,17 @@ Corruption is typically repaired within ~300-400ms, before the next Claude sessi
 - PowerShell 5.1 or later (ships with Windows)
 - Claude Code (any version affected by the race condition)
 
+## Files
+
+| File | Description |
+|---|---|
+| `Invoke-ClaudeConfigBroker.ps1` | Layer 2: Broker daemon (the main script) |
+| `claude-atomic-writes.js` | Layer 1: Bun preload module for atomic writes |
+| `Install-AtomicWrites.ps1` | Installer for the Bun preload module |
+
 ## Installation
+
+### Layer 2: Broker Daemon (recommended)
 
 1. Download `Invoke-ClaudeConfigBroker.ps1` to a permanent location:
 
@@ -95,6 +122,28 @@ if (Test-Path $brokerScript) {
 
 The single-instance guard ensures only one broker runs, no matter how many terminals you open.
 
+### Layer 1: Bun Preload (optional)
+
+Install the atomic writes preload module:
+
+```powershell
+.\Install-AtomicWrites.ps1
+```
+
+This copies `claude-atomic-writes.js` to `~/.claude/` and adds a preload entry to `~/bunfig.toml`. Use `-Test` to verify:
+
+```powershell
+.\Install-AtomicWrites.ps1 -Test
+```
+
+To remove:
+
+```powershell
+.\Install-AtomicWrites.ps1 -Uninstall
+```
+
+> **Note**: As of Claude Code v2.1.59, the Bun standalone binary is compiled with `--no-compile-autoload-bunfig`, so the preload is not loaded. The installer's `-Test` flag detects this and reports it. Layer 2 (the broker daemon) provides full protection regardless.
+
 ## Usage
 
 ### Interactive (recommended for first run)
@@ -109,14 +158,14 @@ You'll see:
 
 ```
   +---------------------------------------------------------+
-  |        Claude Config Broker Daemon v1.1                 |
+  |        Claude Config Broker Daemon v1.2                 |
   |        "Reverse JSON Proxy" for .claude.json            |
   +---------------------------------------------------------+
     Mutex:     Global\ClaudeConfigBrokerMutex
     Config:    C:\Users\you\.claude.json
     Shadow:    C:\Users\you\.claude\backups\.claude.json.broker-shadow
     Strategy:  DeepMerge
-    Debounce:  300ms
+    Debounce:  100ms
     GapCheck:  2000ms
     LogMax:    10 MB
   +---------------------------------------------------------+
@@ -145,8 +194,8 @@ Stop-Job $broker
 | Parameter | Default | Description |
 |---|---|---|
 | `-MergeStrategy` | `DeepMerge` | `DeepMerge` preserves changes from all sessions. `LastValidWins` is simpler -- no merge, just keeps the last valid state. |
-| `-DebounceMs` | `300` | Wait time after last file event before processing. Increase to `500` if running 7+ parallel sessions. |
-| `-GapCheckMs` | `2000` | Fallback interval to detect missed FSW events. |
+| `-DebounceMs` | `100` | Wait time after last file event before processing. Increase to `300-500` if running 7+ parallel sessions. |
+| `-GapCheckMs` | `2000` | Fallback interval to detect missed FSW events (rounded up to whole seconds). |
 | `-MutexTimeoutMs` | `5000` | Max wait to acquire the named mutex. |
 | `-CleanupDays` | `7` | Delete `.corrupted.*` backup files older than this. |
 | `-LogMaxSizeMB` | `10` | Log file rotation threshold. |
@@ -158,8 +207,8 @@ Stop-Job $broker
 # Conservative mode -- no merging, pure corruption protection
 .\Invoke-ClaudeConfigBroker.ps1 -MergeStrategy LastValidWins
 
-# Tuned for many parallel sessions
-.\Invoke-ClaudeConfigBroker.ps1 -DebounceMs 500
+# Tuned for many parallel sessions (longer debounce reduces write contention)
+.\Invoke-ClaudeConfigBroker.ps1 -DebounceMs 300
 
 # Faster gap detection + smaller log
 .\Invoke-ClaudeConfigBroker.ps1 -GapCheckMs 1000 -LogMaxSizeMB 5
@@ -197,6 +246,8 @@ When a corrupt `.claude.json` is detected:
 | `~/.claude/broker.log` | Daemon log (rotated) |
 | `~/.claude/broker.pid` | PID file for external tooling |
 | `~/.claude/backups/.claude.json.broker-shadow` | Persisted shadow state |
+| `~/.claude/claude-atomic-writes.js` | Bun preload module (Layer 1, created by installer) |
+| `~/bunfig.toml` | Bun configuration with preload entry (created by installer) |
 
 ## No Admin Required
 
@@ -205,13 +256,16 @@ The broker runs entirely in user-space. The `Global\` prefix on the Named Mutex 
 ## FAQ
 
 **Does this fix the root cause?**
-No. The root cause is that Claude Code writes to `~/.claude.json` without atomic operations or file locking. This daemon is a workaround that heals the corruption reactively. The real fix needs to come from Anthropic -- see [#28922](https://github.com/anthropics/claude-code/issues/28922).
+No. The root cause is that Claude Code writes to `~/.claude.json` without atomic operations or file locking. Layer 1 (the Bun preload) would fix the root cause by making Claude Code's own writes atomic, but as of v2.1.59 the preload is not loaded due to `--no-compile-autoload-bunfig`. Layer 2 (the broker daemon) heals corruption reactively. The real fix needs to come from Anthropic -- see [#28922](https://github.com/anthropics/claude-code/issues/28922).
 
 **Is there a performance impact?**
-Negligible. The daemon is event-driven (not polling), uses minimal CPU while idle, and only wakes up when `.claude.json` actually changes.
+Negligible. The daemon is event-driven (not polling), uses minimal CPU while idle, and only wakes up when `.claude.json` actually changes. The Bun preload adds ~1ms overhead per `.claude.json` write (temp file + rename) and zero overhead for all other files.
 
 **Can this make things worse?**
-The broker uses atomic writes (temp + rename) for all its own operations and validates JSON before writing. It cannot introduce corruption. In the worst case (broker crash, mutex timeout), it simply does nothing and Claude Code's built-in backup recovery takes over.
+The broker uses `File.Replace` (Win32 `ReplaceFile`) for atomic writes and validates JSON before writing. It cannot introduce corruption. In the worst case (broker crash, mutex timeout), it simply does nothing and Claude Code's built-in backup recovery takes over.
+
+**Why two layers?**
+Layer 1 (preventive) eliminates corruption at the source -- if Anthropic re-enables `bunfig.toml` autoloading, this will "just work" without any daemon needed. Layer 2 (reactive) catches anything Layer 1 misses and provides the safety net. They are independent and either one alone provides protection.
 
 **Does it work on macOS/Linux?**
 Currently Windows-only. The Named Mutex API is Windows-specific. A cross-platform version using `flock` would be possible but is not implemented. Contributions welcome.
