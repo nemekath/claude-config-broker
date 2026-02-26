@@ -89,12 +89,13 @@ function Write-BunfigFile {
 }
 
 function Get-BunfigContent {
+    # Comma prefix prevents PS 5.1 pipeline from unwrapping empty arrays to $null
     if (Test-Path $BunfigPath) {
         $raw = Get-Content -Path $BunfigPath -Encoding UTF8
-        if ($null -eq $raw) { return @() }
-        return @($raw)
+        if ($null -eq $raw) { return ,@() }
+        return ,@($raw)
     }
-    return @()
+    return ,@()
 }
 
 function Add-PreloadEntry {
