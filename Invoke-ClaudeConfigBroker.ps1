@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Config Broker Daemon v1.1 -- a "reverse JSON proxy" that serializes concurrent
+    Config Broker Daemon v1.2 -- a "reverse JSON proxy" that serializes concurrent
     access to ~/.claude.json using a system-wide Named Mutex and JSON deep-merge.
     Compatible with PowerShell 5.1 (.NET Framework) and PowerShell 7+ (.NET 6/8/9).
 
@@ -63,14 +63,18 @@
     Remove .corrupted.* backup files older than this many days (default: 7).
 
 .PARAMETER DebounceMs
-    Milliseconds to wait after the last file event before processing (default: 300).
+    Milliseconds to wait after the last file event before processing (default: 100).
+    Reduced from 300ms in v1.1 for faster reactive response. Safe because the Bun
+    preload (Layer 1) writes to a temp file first — the config file is untouched
+    until the atomic rename, so the broker never reads a partially-written file.
     Prevents multiple processing runs during rapid successive writes.
 
 .PARAMETER GapCheckMs
     Timeout in milliseconds for gap detection fallback (default: 2000).
     When no FSW event arrives within this window, the daemon checks the file's
     LastWriteTimeUtc to catch any missed changes. Lower values detect gaps faster
-    but increase idle CPU usage slightly.
+    but increase idle CPU usage slightly. Rounded up to whole seconds internally
+    (Wait-Event -Timeout accepts seconds only).
 
 .PARAMETER MutexTimeoutMs
     Max wait time in milliseconds to acquire the named mutex (default: 5000).
@@ -111,7 +115,7 @@ param(
     [int]$CleanupDays     = 7,
 
     [ValidateRange(50, 10000)]
-    [int]$DebounceMs      = 300,
+    [int]$DebounceMs      = 100,
 
     [ValidateRange(500, 30000)]
     [int]$GapCheckMs      = 2000,
@@ -147,7 +151,15 @@ if (-not (Test-Path $BackupDir)) {
 }
 
 # Clean up stale temp files from previous hard crashes (kill -9, BSOD)
+# broker-tmp files are only created by this broker (single-instance guard ensures no race)
 Get-ChildItem -Path $WatchDir -Filter '.claude.json.broker-tmp.*' -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+# broker-atomic files are created by the JS preload in Claude Code processes — only delete
+# files older than 10 seconds to avoid racing with an in-flight atomic write
+# Use UTC to avoid DST-transition edge cases
+$atomicCutoff = [DateTime]::UtcNow.AddSeconds(-10)
+Get-ChildItem -Path $WatchDir -Filter '.claude.json.broker-atomic.*' -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTimeUtc -lt $atomicCutoff } |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
 # =============================================================================
@@ -165,8 +177,11 @@ try {
     # is now owned by this thread (standard .NET behavior). We take over.
 }
 
-# Write PID file for external tools
-$PID | Out-File -FilePath $PidFile -Encoding ascii -Force
+# Write PID file for external tools (no trailing newline, no BOM)
+[System.IO.File]::WriteAllText($PidFile, $PID.ToString())
+
+# BOM-less UTF-8 encoding (PS 5.1 Out-File -Encoding utf8 writes BOM)
+$script:Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 
 # =============================================================================
 # LOGGING
@@ -181,7 +196,10 @@ function Invoke-LogRotation {
             if (Test-Path $rotated) { Remove-Item $rotated -Force -ErrorAction SilentlyContinue }
             Move-FileAtomic $LogFile $rotated
         }
-    } catch { }
+    } catch {
+        # Log rotation is non-critical — log continues growing until next attempt
+        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [WARN] Log rotation failed: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
 }
 
 function Write-Log {
@@ -197,13 +215,14 @@ function Write-Log {
         default   { 'Gray' }
     }
     Write-Host $entry -ForegroundColor $color
-    try { $entry | Out-File -FilePath $LogFile -Append -Encoding ascii } catch { }
+    try { [System.IO.File]::AppendAllText($LogFile, "$entry`r`n", $script:Utf8NoBom) } catch { }
 }
 
 # =============================================================================
 # NAMED MUTEX WRAPPER
 # =============================================================================
 $configMutex = [System.Threading.Mutex]::new($false, $MutexName)
+$script:ConfigMutexHeld = $false
 
 function Invoke-WithLock {
     <#
@@ -223,43 +242,56 @@ function Invoke-WithLock {
             Write-Log "Mutex timeout (${MutexTimeoutMs}ms) for: $Description" 'WARN'
             return $null
         }
+        $script:ConfigMutexHeld = $true
         Write-Log "Lock acquired: $Description" 'LOCK'
         return & $Action
     } catch [System.Threading.AbandonedMutexException] {
         # Another process holding the mutex crashed -- we inherit it
         $acquired = $true
+        $script:ConfigMutexHeld = $true
         Write-Log "Inherited abandoned mutex for: $Description" 'WARN'
         return & $Action
     } finally {
         if ($acquired) {
             try { $configMutex.ReleaseMutex() } catch { }
+            $script:ConfigMutexHeld = $false
             Write-Log "Lock released: $Description" 'LOCK'
         }
     }
 }
 
 # =============================================================================
-# CROSS-RUNTIME FILE MOVE (PS 5.1 + PS 7)
+# CROSS-RUNTIME ATOMIC FILE MOVE (PS 5.1 + PS 7)
 # =============================================================================
-# .NET 6+ has File.Move(src, dst, overwrite). .NET Framework does not.
-# Detect once at startup, then use the fast path or fallback.
-$script:HasMoveOverwrite = @([System.IO.File].GetMethods() |
-    Where-Object { $_.Name -eq 'Move' -and $_.GetParameters().Count -eq 3 }).Count -gt 0
+# Uses File.Replace (Win32 ReplaceFile) when destination exists — atomically
+# swaps source into destination with no race window. Falls back to File.Move
+# only when destination doesn't exist yet (first shadow persist, first log, etc.).
 
 function Move-FileAtomic {
     <#
     .SYNOPSIS
-        Moves src to dst, overwriting dst if it exists.
-        Uses File.Move(s,d,$true) on .NET 6+, Delete+Move on .NET Framework.
+        Moves src to dst, overwriting dst atomically if it exists.
+        Uses File.Replace() (Win32 ReplaceFile) for atomic replacement,
+        File.Move() only when destination doesn't exist yet.
+        On IOException, retries once after a brief pause. If still failing,
+        propagates the error — callers handle cleanup (temp file + shadow state).
     #>
     param([string]$Source, [string]$Destination)
-    if ($script:HasMoveOverwrite) {
-        [System.IO.File]::Move($Source, $Destination, $true)
-    } else {
-        # .NET Framework fallback: delete then move (tiny race window, acceptable for local config)
-        if ([System.IO.File]::Exists($Destination)) {
-            [System.IO.File]::Delete($Destination)
+    if ([System.IO.File]::Exists($Destination)) {
+        try {
+            # File.Replace: atomically replaces Destination with Source contents.
+            # Third parameter ($null) skips creating a backup of the replaced file.
+            # Also preserves destination's ACLs and alternate data streams.
+            [System.IO.File]::Replace($Source, $Destination, $null)
+        } catch [System.IO.IOException] {
+            # Sharing violation — another process holds a lock. Retry once after
+            # a brief pause (the lock is typically released within milliseconds).
+            # If it still fails, let the exception propagate — the caller's finally
+            # block cleans up the temp file and the destination remains unchanged.
+            Start-Sleep -Milliseconds 50
+            [System.IO.File]::Replace($Source, $Destination, $null)
         }
+    } else {
         [System.IO.File]::Move($Source, $Destination)
     }
 }
@@ -317,7 +349,7 @@ function Write-JsonAtomic {
         # Validate JSON in memory (avoids disk re-read roundtrip ~1-2ms)
         $null = $Json | ConvertFrom-Json -ErrorAction Stop
 
-        [System.IO.File]::WriteAllText($tempPath, $Json, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($tempPath, $Json, $script:Utf8NoBom)
 
         # Atomic replace (cross-runtime: PS 5.1 + PS 7)
         Move-FileAtomic $tempPath $Path
@@ -414,7 +446,10 @@ function ConvertTo-NormalizedJson {
             return [PSCustomObject]$sorted
         }
         if ($Obj -is [System.Collections.IEnumerable] -and $Obj -isnot [string]) {
-            return @($Obj | ForEach-Object { Sort-Properties $_ })
+            # Use foreach instead of pipeline to preserve $null array elements
+            $arr = [System.Collections.ArrayList]::new()
+            foreach ($item in $Obj) { $arr.Add((Sort-Properties $item)) | Out-Null }
+            return @($arr)
         }
         return $Obj
     }
@@ -427,13 +462,11 @@ function ConvertTo-NormalizedJson {
 # SHADOW STATE MANAGEMENT
 # =============================================================================
 $script:ShadowState = $null
-$script:ShadowTimestamp = [datetime]::MinValue
 $script:LastPersistedShadowJson = ''
 
 function Update-ShadowState {
     param([object]$State, [string]$Json = $null)
     $script:ShadowState = $State
-    $script:ShadowTimestamp = Get-Date
 
     if (-not $Json) { $Json = $State | ConvertTo-Json -Depth 50 }
 
@@ -443,7 +476,7 @@ function Update-ShadowState {
     # Persist shadow to disk atomically (non-critical, best-effort)
     try {
         $shadowTmp = "$ShadowFile.tmp.$PID"
-        [System.IO.File]::WriteAllText($shadowTmp, $Json, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText($shadowTmp, $Json, $script:Utf8NoBom)
         Move-FileAtomic $shadowTmp $ShadowFile
         $script:LastPersistedShadowJson = $Json
     } catch {
@@ -494,7 +527,7 @@ function Invoke-ProcessConfigChange {
                     $null -eq $current.PSObject.Properties[$_]
                 }).Count
                 if ($baseOnlyCount -gt 0) {
-                    Write-Log "DeepMerge: $baseOnlyCount shadow-only property/ies preserved (may be intentional deletions). Use -MergeStrategy LastValidWins to avoid." 'WARN'
+                    Write-Log "DeepMerge: $baseOnlyCount top-level shadow-only property/ies preserved (may be intentional deletions). Use -MergeStrategy LastValidWins to avoid." 'WARN'
                 }
 
                 # Fast-path: shadow-only properties exist → merge definitely differs
@@ -509,6 +542,7 @@ function Invoke-ProcessConfigChange {
                     # Serialize once, reuse for config write + shadow persist
                     $mergedJson = $merged | ConvertTo-Json -Depth 50 -Compress:$false
                     Write-JsonAtomic -Path $ConfigFile -Data $merged -Json $mergedJson
+
                     Update-ShadowState $merged -Json $mergedJson
                     Write-Log "Deep-merged shadow + incoming -> wrote merged config." 'MERGE'
                     $script:Stats.Merges++
@@ -543,6 +577,7 @@ function Invoke-ProcessConfigChange {
                 $data = Read-JsonSafe $backup.FullName
                 if ($null -ne $data) {
                     Write-JsonAtomic -Path $ConfigFile -Data $data
+
                     Update-ShadowState $data
                     Write-Log "Restored from Claude backup: $($backup.Name)" 'RESTORE'
                     $script:Stats.Restores++
@@ -559,9 +594,9 @@ function Invoke-ProcessConfigChange {
 # CLEANUP
 # =============================================================================
 function Invoke-BackupCleanup {
-    $cutoff = (Get-Date).AddDays(-$CleanupDays)
+    $cutoff = [DateTime]::UtcNow.AddDays(-$CleanupDays)
     [array]$stale = @(Get-ChildItem -Path $BackupDir -Filter '.claude.json.corrupted.*' -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt $cutoff })
+        Where-Object { $_.LastWriteTimeUtc -lt $cutoff })
     if ($stale.Count -gt 0) {
         $stale | Remove-Item -Force -ErrorAction SilentlyContinue
         Write-Log "Cleaned up $($stale.Count) stale corrupted backups."
@@ -574,7 +609,7 @@ function Invoke-BackupCleanup {
 $banner = @"
 
   +---------------------------------------------------------+
-  |        Claude Config Broker Daemon v1.1                 |
+  |        Claude Config Broker Daemon v1.2                 |
   |        "Reverse JSON Proxy" for .claude.json            |
   +---------------------------------------------------------+
     Mutex:     $MutexName
@@ -594,8 +629,8 @@ $script:Stats = @{
     Restores    = 0
     Merges      = 0
     Snapshots   = 0
-    StartTime   = Get-Date
 }
+$script:RuntimeTimer = [System.Diagnostics.Stopwatch]::StartNew()
 
 # Initial load
 Write-Log 'Initializing...'
@@ -651,26 +686,28 @@ Write-Host ''
 # =============================================================================
 # MAIN LOOP (Event-based with debounce + gap detection fallback)
 # =============================================================================
+$gapTimeoutSec = [math]::Max(1, [math]::Ceiling($GapCheckMs / 1000))
 try {
     while ($true) {
         # Idle wait: block until an event arrives or gap-check timeout
-        $gapTimeoutSec = [math]::Max(1, [math]::Ceiling($GapCheckMs / 1000))
         $ev = Wait-Event -Timeout $gapTimeoutSec
 
-        if ($ev) {
-            # Event received — drain all queued events, then debounce
-            @($ev) | ForEach-Object { Remove-Event -EventIdentifier $_.EventIdentifier }
-            Get-Event -ErrorAction SilentlyContinue | Remove-Event
+        if ($ev -and $ev.SourceIdentifier -like 'BrokerFSW_*') {
+            # FSW event received — drain remaining FSW events (preserve non-FSW events)
+            Remove-Event -EventIdentifier $ev.EventIdentifier -ErrorAction SilentlyContinue
+            Get-Event -ErrorAction SilentlyContinue |
+                Where-Object { $_.SourceIdentifier -like 'BrokerFSW_*' } | Remove-Event
 
-            # Debounce: wait for writes to settle (no new events for DebounceMs)
-            $debounceEnd = (Get-Date).AddMilliseconds($DebounceMs)
-            while ((Get-Date) -lt $debounceEnd) {
+            # Debounce: wait for writes to settle (monotonic clock, immune to DST/NTP)
+            $debounceTimer = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($debounceTimer.ElapsedMilliseconds -lt $DebounceMs) {
                 Start-Sleep -Milliseconds 50
-                $pending = @(Get-Event -ErrorAction SilentlyContinue)
+                $pending = @(Get-Event -ErrorAction SilentlyContinue |
+                    Where-Object { $_.SourceIdentifier -like 'BrokerFSW_*' })
                 if ($pending.Count -gt 0) {
                     $pending | Remove-Event
                     # New events arrived — reset debounce window
-                    $debounceEnd = (Get-Date).AddMilliseconds($DebounceMs)
+                    $debounceTimer.Restart()
                 }
             }
 
@@ -678,7 +715,11 @@ try {
             Invoke-ProcessConfigChange
             $script:LastKnownWriteTime = ([System.IO.FileInfo]::new($ConfigFile)).LastWriteTimeUtc
         } else {
-            # Timeout — gap detection fallback (covers events missed during processing)
+            # Remove non-FSW event to prevent busy-spin (Wait-Event peeks, doesn't consume)
+            if ($ev) {
+                Remove-Event -EventIdentifier $ev.EventIdentifier -ErrorAction SilentlyContinue
+            }
+            # Timeout or non-FSW event — gap detection fallback
             $currentWriteTime = ([System.IO.FileInfo]::new($ConfigFile)).LastWriteTimeUtc
             if ($currentWriteTime -gt $script:LastKnownWriteTime) {
                 Write-Log 'Detected missed file change (watcher gap recovery).' 'WARN'
@@ -708,7 +749,9 @@ try {
         Unregister-Event -ErrorAction SilentlyContinue
     $watcher.EnableRaisingEvents = $false
     $watcher.Dispose()
-    try { $configMutex.ReleaseMutex() } catch { }
+    if ($script:ConfigMutexHeld) {
+        try { $configMutex.ReleaseMutex() } catch { }
+    }
     $configMutex.Dispose()
 
     # Remove PID file
@@ -719,11 +762,12 @@ try {
         $instanceMutex.Dispose()
     }
 
-    $runtime = (Get-Date) - $script:Stats.StartTime
+    $script:RuntimeTimer.Stop()
+    $runtime = $script:RuntimeTimer.Elapsed
     Write-Host ''
     Write-Log '==========================================================='
     Write-Log 'Broker stopped. Session stats:'
-    Write-Log "  Runtime:      $($runtime.ToString('hh\:mm\:ss'))"
+    Write-Log "  Runtime:      $([int][math]::Floor($runtime.TotalHours)):$($runtime.ToString('mm\:ss'))"
     Write-Log "  Corruptions:  $($script:Stats.Corruptions)"
     Write-Log "  Restores:     $($script:Stats.Restores)"
     Write-Log "  Deep Merges:  $($script:Stats.Merges)"
