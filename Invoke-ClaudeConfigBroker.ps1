@@ -280,16 +280,17 @@ function Move-FileAtomic {
     if ([System.IO.File]::Exists($Destination)) {
         try {
             # File.Replace: atomically replaces Destination with Source contents.
-            # Third parameter ($null) skips creating a backup of the replaced file.
+            # Third parameter (NullString) skips backup. Must use [NullString]::Value
+            # instead of $null — PS 5.1 auto-converts $null to "" which is invalid.
             # Also preserves destination's ACLs and alternate data streams.
-            [System.IO.File]::Replace($Source, $Destination, $null)
+            [System.IO.File]::Replace($Source, $Destination, [NullString]::Value)
         } catch [System.IO.IOException] {
             # Sharing violation — another process holds a lock. Retry once after
             # a brief pause (the lock is typically released within milliseconds).
             # If it still fails, let the exception propagate — the caller's finally
             # block cleans up the temp file and the destination remains unchanged.
             Start-Sleep -Milliseconds 50
-            [System.IO.File]::Replace($Source, $Destination, $null)
+            [System.IO.File]::Replace($Source, $Destination, [NullString]::Value)
         }
     } else {
         [System.IO.File]::Move($Source, $Destination)
