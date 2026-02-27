@@ -64,9 +64,9 @@
 
 .PARAMETER DebounceMs
     Milliseconds to wait after the last file event before processing (default: 100).
-    Reduced from 300ms in v1.1 for faster reactive response. Safe because the Bun
-    preload (Layer 1) writes to a temp file first — the config file is untouched
-    until the atomic rename, so the broker never reads a partially-written file.
+    Reduced from 300ms in v1.1 for faster reactive response. Safe without Layer 1
+    because Read-JsonSafe validates JSON and retries once after 50ms on parse failure;
+    corrupt reads trigger a restore from shadow state, never silent data loss.
     Prevents multiple processing runs during rapid successive writes.
 
 .PARAMETER GapCheckMs
@@ -572,7 +572,7 @@ function Invoke-ProcessConfigChange {
 
             # Fallback: search Claude Code's own backups
             [array]$backups = @(Get-ChildItem -Path $BackupDir -Filter '.claude.json.backup.*' -ErrorAction SilentlyContinue |
-                Sort-Object LastWriteTime -Descending)
+                Sort-Object LastWriteTimeUtc -Descending)
 
             foreach ($backup in $backups) {
                 $data = Read-JsonSafe $backup.FullName
@@ -712,8 +712,12 @@ try {
                 }
             }
 
-            # Debounce settled — process
-            Invoke-ProcessConfigChange
+            # Debounce settled — process (catch transient errors to keep daemon alive)
+            try {
+                Invoke-ProcessConfigChange
+            } catch {
+                Write-Log "Config processing failed (will retry on next event): $($_.Exception.Message)" 'ERROR'
+            }
             $script:LastKnownWriteTime = ([System.IO.FileInfo]::new($ConfigFile)).LastWriteTimeUtc
         } else {
             # Remove non-FSW event to prevent busy-spin (Wait-Event peeks, doesn't consume)
@@ -724,7 +728,11 @@ try {
             $currentWriteTime = ([System.IO.FileInfo]::new($ConfigFile)).LastWriteTimeUtc
             if ($currentWriteTime -gt $script:LastKnownWriteTime) {
                 Write-Log 'Detected missed file change (watcher gap recovery).' 'WARN'
-                Invoke-ProcessConfigChange
+                try {
+                    Invoke-ProcessConfigChange
+                } catch {
+                    Write-Log "Config processing failed (will retry on next event): $($_.Exception.Message)" 'ERROR'
+                }
                 $script:LastKnownWriteTime = ([System.IO.FileInfo]::new($ConfigFile)).LastWriteTimeUtc
             }
         }
