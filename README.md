@@ -11,7 +11,7 @@ Claude configuration file at C:\Users\<user>\.claude.json is corrupted: JSON Par
 The corrupted file has been backed up to: C:\Users\<user>\.claude\backups\.claude.json.corrupted.<timestamp>
 ```
 
-This bug has been [reported at least 8 times since June 2025](https://github.com/anthropics/claude-code/issues/28922) and affects Windows, macOS, and Linux. As of v2.1.59, Claude Code still does not use atomic writes or file locking.
+This bug has been [reported multiple times since June 2025](https://github.com/anthropics/claude-code/issues/29217) and affects Windows, macOS, and Linux. As of v2.1.59, Claude Code still does not use atomic writes or file locking.
 
 With just 2 parallel sessions, users report **hundreds of corrupted backup files per day**. The corruption is non-destructive (Claude Code recovers from backups), but disruptive -- error messages spam every open terminal and interrupt workflow.
 
@@ -256,7 +256,7 @@ The broker runs entirely in user-space. The `Global\` prefix on the Named Mutex 
 ## FAQ
 
 **Does this fix the root cause?**
-No. The root cause is that Claude Code writes to `~/.claude.json` without atomic operations or file locking. Layer 1 (the Bun preload) would fix the root cause by making Claude Code's own writes atomic, but as of v2.1.59 the preload is not loaded due to `--no-compile-autoload-bunfig`. Layer 2 (the broker daemon) heals corruption reactively. The real fix needs to come from Anthropic -- see [#28922](https://github.com/anthropics/claude-code/issues/28922).
+No. The root cause is that Claude Code writes to `~/.claude.json` without atomic operations or file locking. Layer 1 (the Bun preload) would fix the root cause by making Claude Code's own writes atomic, but as of v2.1.59 the preload is not loaded due to `--no-compile-autoload-bunfig`. Layer 2 (the broker daemon) heals corruption reactively. The real fix needs to come from Anthropic -- see [#29217](https://github.com/anthropics/claude-code/issues/29217).
 
 **Is there a performance impact?**
 Negligible. The daemon is event-driven (not polling), uses minimal CPU while idle, and only wakes up when `.claude.json` actually changes. The Bun preload adds ~1ms overhead per `.claude.json` write (temp file + rename) and zero overhead for all other files.
@@ -272,10 +272,12 @@ Currently Windows-only. The Named Mutex API is Windows-specific. A cross-platfor
 
 ## Related Issues
 
-- [#28922](https://github.com/anthropics/claude-code/issues/28922) -- Meta-issue: reported 8 times since June 2025
-- [#28847](https://github.com/anthropics/claude-code/issues/28847) -- Race condition with multiple instances
-- [#28813](https://github.com/anthropics/claude-code/issues/28813) -- Concurrent CLI sessions on Windows
-- [#3117](https://github.com/anthropics/claude-code/issues/3117) -- Same issue on macOS (July 2025)
+- [#29217](https://github.com/anthropics/claude-code/issues/29217) -- Race condition: .claude.json corrupted by concurrent writes (main tracking issue, open)
+- [#29250](https://github.com/anthropics/claude-code/issues/29250) -- Non-atomic writes to .claude.json (duplicate of #29217, open)
+- [#2593](https://github.com/anthropics/claude-code/issues/2593) -- Original report of .claude.json truncation (closed)
+- [#28922](https://github.com/anthropics/claude-code/issues/28922) -- Meta-issue: reported 8 times since June 2025 (closed)
+- [#3117](https://github.com/anthropics/claude-code/issues/3117) -- Same issue on macOS (closed)
+
 
 ## License
 
